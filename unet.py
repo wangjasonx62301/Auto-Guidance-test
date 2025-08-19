@@ -96,7 +96,7 @@ class Up(nn.Module):
         return x
 
 class UNet(nn.Module):
-    def __init__(self, in_ch=3, base_ch=128, ch_mults=(1, 2, 2, 2), time_emb_dim=512, with_attn=(False, True, True, False)):
+    def __init__(self, in_ch=3, base_ch=128, ch_mults=(1, 2, 2, 2), time_emb_dim=512, with_attn=(False, True, True, False), num_classes=None):
         super().__init__()
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim // 2, time_emb_dim),
@@ -104,8 +104,13 @@ class UNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim),
         )
 
+        self.time_in_dim = time_emb_dim // 2
+        
         self.init_conv = nn.Conv2d(in_ch, base_ch, 3, padding=1)
-
+        self.num_classes = num_classes
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, self.time_in_dim)
+            
         downs = []
         ch = base_ch
         self.skips_channels = []
@@ -133,9 +138,18 @@ class UNet(nn.Module):
 
         self.time_emb_dim = time_emb_dim
 
-    def forward(self, x, t):
-        t_emb = timestep_embedding(t, self.time_emb_dim // 2)
-        t_emb = self.time_mlp(t_emb)
+    def forward(self, x, t, y=None):
+        
+        
+        t_sin = timestep_embedding(t, self.time_in_dim)
+        
+        if (self.num_classes is not None) and (y is not None):
+            y_emb = self.label_emb(y) 
+            t_in = y_emb + t_sin
+        else:
+            t_in = t_sin
+            
+        t_emb = self.time_mlp(t_in)
         x = self.init_conv(x)
         skips = []
         for down in self.downs:
