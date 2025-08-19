@@ -2,7 +2,7 @@ import os
 import math
 import argparse
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -49,13 +49,17 @@ class DDPMConfig:
     # training
     lr: float = 2e-4
     batch_size: int = 128
-    epochs: int = 50
+    epochs: int = 200
     grad_accum: int = 1
     ema_decay: float = 0.999
     logdir: str = "runs/ddpm"
     ckpt_every: int = 5
 
-
+    # CFG
+    num_classes: int = 10
+    drop_cond_prob: float = 0.1    
+    guidance_scale: float = 3.0    
+    
 # ---------------------------- Beta Schedules -------------------------------
 
 def make_beta_schedule(T: int, schedule: str = "linear", beta_start: float = 1e-4, beta_end: float = 2e-2) -> torch.Tensor:
@@ -107,22 +111,34 @@ class DDPM(nn.Module):
         return sqrt_ab * x0 + sqrt_omab * noise
 
     # Training loss: predict epsilon (noise)
-    def p_losses(self, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         noise = torch.randn_like(x0).to(self.device)
         x_noisy = self.q_sample(x0, t, noise).to(self.device)
-        noise_pred = self.model(x_noisy, t).to(self.device)
+        
+        if (y is not None) and (torch.rand(1, device=x0.device).item() < self.cfg.drop_cond_prob):
+            y_in = None
+        else:
+            y_in = y
+            
+        noise_pred = self.model(x_noisy, t, y_in).to(self.device)
         loss = F.mse_loss(noise_pred, noise)
         return loss, noise_pred
 
     # Sampling step: x_{t-1} from x_t
     @torch.no_grad()
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0) -> torch.Tensor:
         betas_t = self.betas[t][:, None, None, None]
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t][:, None, None, None]
         sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t][:, None, None, None]
 
         # predict noise using the model
-        eps_theta = self.model(x_t, t)
+        if y is not None and guidance_scale == 1.0:
+            # Classifier-Free Guidance
+            eps_theta = self.model(x_t, t, None if y is None else y)
+        else:
+            eps_uncond = self.model(x_t, t, None)
+            eps_cond   = self.model(x_t, t, y)
+            eps_theta  = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
         # DDPM mean
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * eps_theta / sqrt_one_minus_alphas_bar_t)
@@ -136,12 +152,17 @@ class DDPM(nn.Module):
 
     # Full sampling loop from pure noise
     @torch.no_grad()
-    def sample(self, batch_size: int) -> torch.Tensor:
+    def sample(self, batch_size: int, labels: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None) -> torch.Tensor:
         self.model.eval()
+        g = self.cfg.guidance_scale if guidance_scale is None else guidance_scale
         img = torch.randn(batch_size, self.cfg.channels, self.cfg.image_size, self.cfg.image_size, device=self.device)
+        
+        if labels is not None:
+            labels = labels.to(self.device)
+        
         for i in reversed(range(self.cfg.timesteps)):
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            img = self.p_sample(img, t)
+            img = self.p_sample(img, t, y=labels, guidance_scale=g)
         return img
 
 
@@ -199,7 +220,7 @@ def train(cfg: DDPMConfig):
     train_loader, _ = get_dataloaders(data_dir=os.path.join(cfg.logdir, "data"), batch_size=cfg.batch_size)
 
     # Model
-    model = UNet(in_ch=cfg.channels, base_ch=128, ch_mults=(1, 2, 2, 2), time_emb_dim=512, with_attn=(False, True, True, False))
+    model = UNet(in_ch=cfg.channels, base_ch=128, ch_mults=(1, 2, 2, 2), time_emb_dim=512, with_attn=(False, True, True, False), num_classes=cfg.num_classes)
     model.to(device)
 
     # DDPM wrapper
@@ -213,12 +234,17 @@ def train(cfg: DDPMConfig):
     model.train()
 
     for epoch in range(cfg.epochs):
-        for x, _ in train_loader:
+        for x, y in train_loader:
             x = x.to(device)
+            y = y.to(device) if y is not None else None
+            
             b = x.size(0)
             t = torch.randint(0, cfg.timesteps, (b,), device=device, dtype=torch.long)
 
-            loss, _ = ddpm.p_losses(x, t)
+            use_uncond = torch.rand(1, device=x.device).item() < cfg.drop_cond_prob
+            y_in = None if use_uncond else y
+            
+            loss, _ = ddpm.p_losses(x, t, y=y_in)
             loss.backward()
 
             if (global_step + 1) % cfg.grad_accum == 0:
@@ -270,6 +296,10 @@ def build_argparser():
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--logdir", type=str, default="runs/ddpm")
     p.add_argument("--ckpt_every", type=int, default=5)
+    
+    p.add_argument("--num_classes", type=int, default=10)
+    p.add_argument("--drop_cond_prob", type=float, default=0.1)
+    p.add_argument("--guidance_scale", type=float, default=3.0)
     return p
 
 
