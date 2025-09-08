@@ -3,22 +3,19 @@ import math
 import argparse
 from dataclasses import dataclass
 from typing import Tuple, Optional
+import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
-
+from pytorch_fid import fid_score
+from tqdm import tqdm
 # -----------------------------------------------------------------------------
-# Import your UNet and dataloader
-from unet import UNet  # Ensure this matches your actual file structure
-from dataset import get_dataloaders  # Ensure this matches your actual file structure
-# Replace the following with your actual module paths
-# from your_unet_file import UNet
-# from your_dataloader_file import get_dataloaders
+from unet import UNet 
+from dataset import get_dataloaders  
 # -----------------------------------------------------------------------------
-
 # --- PLACEHOLDER IMPORTS (delete these and uncomment your real imports) ---
 # Minimal UNet stub so this file is syntactically valid if imported alone.
 # You should REMOVE this stub and import your own UNet implementation.
@@ -49,7 +46,7 @@ class DDPMConfig:
     # training
     lr: float = 2e-4
     batch_size: int = 128
-    epochs: int = 200
+    epochs: int = 1000000
     grad_accum: int = 1
     ema_decay: float = 0.999
     logdir: str = "runs/ddpm"
@@ -59,6 +56,7 @@ class DDPMConfig:
     num_classes: int = 10
     drop_cond_prob: float = 0.1    
     guidance_scale: float = 3.0    
+    guidance_mode: Optional[str] = 'cfg'  # 'cfg' or 'autog' or None
     
 # ---------------------------- Beta Schedules -------------------------------
 
@@ -81,11 +79,12 @@ def make_beta_schedule(T: int, schedule: str = "linear", beta_start: float = 1e-
 # ----------------------------- DDPM Core -----------------------------------
 
 class DDPM(nn.Module):
-    def __init__(self, model: nn.Module, config: DDPMConfig, device: torch.device = None):
+    def __init__(self, model: nn.Module, config: DDPMConfig, device: torch.device = None, bad_model: nn.Module = None):
         super().__init__()
         self.model = model
         self.cfg = config
         self.device = device or default_device()
+        self.bad_model = bad_model
 
         # precompute buffers
         betas = make_beta_schedule(config.timesteps, config.beta_schedule, config.beta_start, config.beta_end).to(device)
@@ -102,6 +101,12 @@ class DDPM(nn.Module):
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
         self.register_buffer("posterior_variance", betas * (1.0 - alphas_bar_prev) / (1.0 - alphas_bar))
 
+    def get_bad_model_from_snapshot(self):
+        self.bad_model = copy.deepcopy(self.model).eval().to(self.device)
+        for p in self.bad_model.parameters():
+            p.requires_grad = False
+            
+    
     # q(x_t | x_0)
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
         if noise is None:
@@ -126,19 +131,30 @@ class DDPM(nn.Module):
 
     # Sampling step: x_{t-1} from x_t
     @torch.no_grad()
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0) -> torch.Tensor:
+    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0, guidance_mode: Optional[str] = None) -> torch.Tensor:
         betas_t = self.betas[t][:, None, None, None]
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t][:, None, None, None]
         sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t][:, None, None, None]
 
         # predict noise using the model
-        if y is not None and guidance_scale == 1.0:
+        if guidance_mode == 'none' and guidance_scale == 1.0:
             # Classifier-Free Guidance
             eps_theta = self.model(x_t, t, None if y is None else y)
-        else:
+        elif guidance_mode == 'cfg':
             eps_uncond = self.model(x_t, t, None)
             eps_cond   = self.model(x_t, t, y)
-            eps_theta  = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            w = guidance_scale
+            eps_theta = (1 + w) * eps_cond - w * eps_uncond
+            
+        elif guidance_mode == 'autog':
+            # Auto-Guidance
+            assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
+            eps_pos = self.model(x_t, t, y)
+            eps_bad = self.bad_model(x_t, t, y)
+            w = guidance_scale
+            eps_theta = w * eps_pos - (1 - w) * eps_bad
+        else:
+            raise ValueError(f"Unknown guidance mode: {guidance_mode}")
 
         # DDPM mean
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * eps_theta / sqrt_one_minus_alphas_bar_t)
@@ -152,17 +168,20 @@ class DDPM(nn.Module):
 
     # Full sampling loop from pure noise
     @torch.no_grad()
-    def sample(self, batch_size: int, labels: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None) -> torch.Tensor:
+    def sample(self, batch_size: int, labels: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None, guidance_mode: Optional[str] = None) -> torch.Tensor:
         self.model.eval()
         g = self.cfg.guidance_scale if guidance_scale is None else guidance_scale
         img = torch.randn(batch_size, self.cfg.channels, self.cfg.image_size, self.cfg.image_size, device=self.device)
+        
+        if self.bad_model is not None:
+            self.bad_model.eval()
         
         if labels is not None:
             labels = labels.to(self.device)
         
         for i in reversed(range(self.cfg.timesteps)):
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            img = self.p_sample(img, t, y=labels, guidance_scale=g)
+            img = self.p_sample(img, t, y=labels, guidance_scale=g, guidance_mode=guidance_mode)
         return img
 
 
@@ -204,9 +223,9 @@ class EMA:
 # ----------------------------- Training Loop -------------------------------
 
 @torch.no_grad()
-def save_samples(ddpm: DDPM, out_dir: str, step: int, n: int = 16):
+def save_samples(ddpm: DDPM, out_dir: str, step: int, n: int = 16, guidance_scale: Optional[float] = None, guidance_mode: Optional[str] = None):
     os.makedirs(out_dir, exist_ok=True)
-    samples = ddpm.sample(n)
+    samples = ddpm.sample(n, guidance_scale=guidance_scale, guidance_mode=guidance_mode)
     # The training data is normalized to [-1, 1]; save_image can auto-normalize
     save_path = os.path.join(out_dir, f"samples_step_{step:07d}.png")
     save_image(samples, save_path, nrow=int(math.sqrt(n)), normalize=True, value_range=(-1, 1))
@@ -229,12 +248,17 @@ def train(cfg: DDPMConfig):
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     ema = EMA(model, decay=cfg.ema_decay)
+    
+    # loss, fid tracking
+    fid_values = []
+    loss_values = []
 
     global_step = 0
     model.train()
 
     for epoch in range(cfg.epochs):
-        for x, y in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs}", leave=False)
+        for x, y in pbar:
             x = x.to(device)
             y = y.to(device) if y is not None else None
             
@@ -246,7 +270,8 @@ def train(cfg: DDPMConfig):
             
             loss, _ = ddpm.p_losses(x, t, y=y_in)
             loss.backward()
-
+            loss_values.append(loss.item())
+            
             if (global_step + 1) % cfg.grad_accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -259,7 +284,9 @@ def train(cfg: DDPMConfig):
             if global_step % 5000 == 0 and global_step > 0:
                 # Save samples with EMA weights for better quality
                 ema.apply_shadow(model)
-                save_samples(ddpm, os.path.join(cfg.logdir, "samples"), step=global_step, n=16)
+                save_samples(ddpm, os.path.join(cfg.logdir, "samples"), step=global_step, n=16, guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
+                fid = compute_fid(ddpm, train_loader, device, out_dir=os.path.join(cfg.logdir, "fid"), n_samples=1024, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
+                fid_values.append(fid)
                 ema.restore(model)
 
             global_step += 1
@@ -276,7 +303,87 @@ def train(cfg: DDPMConfig):
                 "step": global_step,
             }, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
+    
+    plot_all(loss_values, fid_values, out_dir=cfg.logdir)
+    
+def plot_loss(loss_values, out_path):
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(loss_values)
+    plt.title('Training Loss over Time')
+    plt.xlabel('Iteration')
+    plt.ylabel('MSE Loss')
+    plt.grid(True)
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved loss plot to {out_path}")
 
+def plot_all(loss_values, fid_values, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    plot_loss(loss_values, os.path.join(out_dir, "training_loss.png"))
+    plot_fid(fid_values, os.path.join(out_dir, "fid_over_time.png"))
+
+# ----------------------------- FID Computation -----------------------------
+@torch.no_grad()
+def compute_fid(ddpm: DDPM, data_loader, device: torch.device, out_dir: str, n_samples: int = 5000, batch_size: int = 128, guidance_scale: Optional[float] = None, guidance_mode: Optional[str] = None) -> float:
+    """
+    Compute FID score between generated samples and real CIFAR-10 images.
+
+    Args:
+        ddpm: Trained DDPM instance
+        data_loader: real CIFAR-10 dataloader (for true samples)
+        device: torch device
+        out_dir: directory to save temporary samples
+        n_samples: number of generated samples to compare
+        batch_size: batch size for sampling
+    Returns:
+        fid (float)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    gen_dir = os.path.join(out_dir, "generated")
+    real_dir = os.path.join(out_dir, "real")
+    os.makedirs(gen_dir, exist_ok=True)
+    os.makedirs(real_dir, exist_ok=True)
+
+    # --- Generate fake images ---
+    total = 0
+    while total < n_samples:
+        cur_bs = min(batch_size, n_samples - total)
+        samples = ddpm.sample(cur_bs, guidance_scale=guidance_scale, guidance_mode=guidance_mode).detach().cpu()
+        for i in range(cur_bs):
+            save_path = os.path.join(gen_dir, f"{total+i:06d}.png")
+            save_image(samples[i], save_path, normalize=True, value_range=(-1, 1))
+        total += cur_bs
+
+    # --- Save real images (same n_samples for fair FID) ---
+    total = 0
+    for x, _ in data_loader:
+        for i in range(x.size(0)):
+            if total >= n_samples:
+                break
+            save_path = os.path.join(real_dir, f"{total:06d}.png")
+            save_image(x[i], save_path, normalize=True, value_range=(-1, 1))
+            total += 1
+        if total >= n_samples:
+            break
+
+    # --- Compute FID ---
+    paths = [real_dir, gen_dir]
+    fid_value = fid_score.calculate_fid_given_paths(paths, batch_size, device, dims=2048)
+    print(f"FID: {fid_value:.4f}")
+    return fid_value
+
+def plot_fid(fid_values, out_path):
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(fid_values, marker='o')
+    plt.title('FID over Time')
+    plt.xlabel('Evaluation Step')
+    plt.ylabel('FID')
+    plt.grid(True)
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved FID plot to {out_path}")
 
 # ----------------------------- CLI -----------------------------------------
 
@@ -299,6 +406,7 @@ def build_argparser():
     
     p.add_argument("--num_classes", type=int, default=10)
     p.add_argument("--drop_cond_prob", type=float, default=0.1)
+    p.add_argument("--guidance_mode", type=str, default='cfg', choices=['cfg', 'autog', 'none'])
     p.add_argument("--guidance_scale", type=float, default=3.0)
     return p
 
