@@ -38,7 +38,7 @@ def default_device() -> torch.device:
 class DDPMConfig:
     image_size: int = 32
     channels: int = 3
-    timesteps: int = 1000
+    timesteps: int = 5000
     beta_schedule: str = "linear"  # [linear|cosine]
     beta_start: float = 1e-4
     beta_end: float = 2e-2
@@ -46,7 +46,7 @@ class DDPMConfig:
     # training
     lr: float = 2e-4
     batch_size: int = 128
-    epochs: int = 1000000
+    epochs: int = 10000
     grad_accum: int = 1
     ema_decay: float = 0.999
     logdir: str = "runs/ddpm"
@@ -57,6 +57,9 @@ class DDPMConfig:
     drop_cond_prob: float = 0.1    
     guidance_scale: float = 3.0    
     guidance_mode: Optional[str] = 'cfg'  # 'cfg' or 'autog' or None
+    
+    # path
+    ckpt_path: Optional[str] = None
     
 # ---------------------------- Beta Schedules -------------------------------
 
@@ -197,13 +200,13 @@ class EMA:
     def register(self, model: nn.Module):
         for name, p in model.named_parameters():
             if p.requires_grad:
-                self.shadow[name] = p.data.clone()
+                self.shadow[name] = p.data.clone().to(p.device)
 
     def update(self, model: nn.Module):
         for name, p in model.named_parameters():
             if p.requires_grad:
                 assert name in self.shadow
-                new_average = (1.0 - self.decay) * p.data + self.decay * self.shadow[name]
+                new_average = (1.0 - self.decay) * p.data + self.decay * self.shadow[name].to(p.device)
                 self.shadow[name] = new_average.clone()
 
     def apply_shadow(self, model: nn.Module):
@@ -253,6 +256,13 @@ def train(cfg: DDPMConfig):
     fid_values = []
     loss_values = []
 
+    # bad model for Auto-Guidance
+    if cfg.guidance_mode == 'autog':
+        assert cfg.ckpt_path is not None, "Please provide a checkpoint path for bad model in Auto-Guidance mode."
+        ddpm.model = load_checkpoint(cfg.ckpt_path, model, ema, opt)[0].to(device)
+        ddpm.get_bad_model_from_snapshot()
+        print("Bad model for Auto-Guidance is set.")
+
     global_step = 0
     model.train()
 
@@ -285,7 +295,7 @@ def train(cfg: DDPMConfig):
                 # Save samples with EMA weights for better quality
                 ema.apply_shadow(model)
                 save_samples(ddpm, os.path.join(cfg.logdir, "samples"), step=global_step, n=16, guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
-                fid = compute_fid(ddpm, train_loader, device, out_dir=os.path.join(cfg.logdir, "fid"), n_samples=1024, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
+                fid = compute_fid(ddpm, train_loader, device, out_dir=os.path.join(cfg.logdir, "fid"), n_samples=5000, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
                 fid_values.append(fid)
                 ema.restore(model)
 
@@ -318,10 +328,21 @@ def plot_loss(loss_values, out_path):
     plt.close()
     print(f"Saved loss plot to {out_path}")
 
-def plot_all(loss_values, fid_values, out_dir):
+def plot_all(loss_values, fid_values, out_dir, mode=None):
     os.makedirs(out_dir, exist_ok=True)
-    plot_loss(loss_values, os.path.join(out_dir, "training_loss.png"))
-    plot_fid(fid_values, os.path.join(out_dir, "fid_over_time.png"))
+    plot_loss(loss_values, os.path.join(out_dir, f"{mode}_training_loss.png"))
+    plot_fid(fid_values, os.path.join(out_dir, f"{mode}_fid_over_time.png"))
+
+def load_checkpoint(ckpt_path: str, model: nn.Module, ema: EMA, opt: torch.optim.Optimizer):
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    model.load_state_dict(checkpoint['model'])
+    ema.shadow = checkpoint['ema']
+    opt.load_state_dict(checkpoint['opt'])
+    step = checkpoint.get('step', 0)
+    print(f"Loaded checkpoint from {ckpt_path} at step {step}")
+    return model, ema, opt, step
+
+
 
 # ----------------------------- FID Computation -----------------------------
 @torch.no_grad()
@@ -398,7 +419,7 @@ def build_argparser():
 
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--logdir", type=str, default="runs/ddpm")
@@ -408,6 +429,9 @@ def build_argparser():
     p.add_argument("--drop_cond_prob", type=float, default=0.1)
     p.add_argument("--guidance_mode", type=str, default='cfg', choices=['cfg', 'autog', 'none'])
     p.add_argument("--guidance_scale", type=float, default=3.0)
+    
+    # p.add_argument("--device", type=str, default='cuda', help="Device to use (default: cuda if available)")
+    p.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to bad model")
     return p
 
 
