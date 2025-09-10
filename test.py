@@ -153,9 +153,9 @@ class DDPM(nn.Module):
             # Auto-Guidance
             assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
             eps_pos = self.model(x_t, t, y)
-            eps_bad = self.bad_model(x_t, t, y)
+            eps_bad = self.bad_model(x_t, t, None)
             w = guidance_scale
-            eps_theta = w * eps_pos - (1 - w) * eps_bad
+            eps_theta = eps_pos + w * (eps_pos - eps_bad)
         else:
             raise ValueError(f"Unknown guidance mode: {guidance_mode}")
 
@@ -255,13 +255,20 @@ def train(cfg: DDPMConfig):
     # loss, fid tracking
     fid_values = []
     loss_values = []
-
+    
     # bad model for Auto-Guidance
+    resume_epochs = 0
+    
     if cfg.guidance_mode == 'autog':
         assert cfg.ckpt_path is not None, "Please provide a checkpoint path for bad model in Auto-Guidance mode."
         ddpm.model = load_checkpoint(cfg.ckpt_path, model, ema, opt)[0].to(device)
         ddpm.get_bad_model_from_snapshot()
         print("Bad model for Auto-Guidance is set.")
+
+    if cfg.ckpt_path is not None:
+        model, ema, opt, start_step = load_checkpoint(cfg.ckpt_path, model, ema, opt)
+        print(f"Resumed training from checkpoint: {cfg.ckpt_path} at step {start_step}")
+        resume_epochs += int(cfg.ckpt_path.split('_')[-1].split('.')[0])  # continue for more epochs
 
     global_step = 0
     model.train()
@@ -304,7 +311,7 @@ def train(cfg: DDPMConfig):
         # checkpoint per epoch
         if (epoch + 1) % cfg.ckpt_every == 0:
             os.makedirs(cfg.logdir, exist_ok=True)
-            ckpt_path = os.path.join(cfg.logdir, f"ckpt_epoch_{epoch+1}.pt")
+            ckpt_path = os.path.join(cfg.logdir, f"ckpt_epoch_{resume_epochs+epoch+1}.pt")
             torch.save({
                 "model": model.state_dict(),
                 "ema": ema.shadow,
@@ -419,7 +426,7 @@ def build_argparser():
 
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--logdir", type=str, default="runs/ddpm")
