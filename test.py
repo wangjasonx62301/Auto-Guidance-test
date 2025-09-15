@@ -57,6 +57,8 @@ class DDPMConfig:
     drop_cond_prob: float = 0.1    
     guidance_scale: float = 3.0    
     guidance_mode: Optional[str] = 'cfg'  # 'cfg' or 'autog' or None
+    train_with_autog: bool = False  # whether to use Auto-Guidance during training (requires bad model)
+    fid_threshold: float = 2.0  # update bad model if fid improves by this much
     
     # path
     ckpt_path: Optional[str] = None
@@ -108,6 +110,13 @@ class DDPM(nn.Module):
         self.bad_model = copy.deepcopy(self.model).eval().to(self.device)
         for p in self.bad_model.parameters():
             p.requires_grad = False
+    
+    def update_bad_model(self, snapshot_state_dict):
+        assert self.bad_model is not None, "Bad model is not set. Call get_bad_model_from_snapshot() first."
+        self.bad_model.load_state_dict(snapshot_state_dict)
+        self.bad_model.eval()
+        for p in self.bad_model.parameters():
+            p.requires_grad = False
             
     
     # q(x_t | x_0)
@@ -119,7 +128,7 @@ class DDPM(nn.Module):
         return sqrt_ab * x0 + sqrt_omab * noise
 
     # Training loss: predict epsilon (noise)
-    def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None, train_with_autog: Optional[bool] = False) -> Tuple[torch.Tensor, torch.Tensor]:
         noise = torch.randn_like(x0).to(self.device)
         x_noisy = self.q_sample(x0, t, noise).to(self.device)
         
@@ -127,10 +136,19 @@ class DDPM(nn.Module):
             y_in = None
         else:
             y_in = y
-            
-        noise_pred = self.model(x_noisy, t, y_in).to(self.device)
-        loss = F.mse_loss(noise_pred, noise)
-        return loss, noise_pred
+        
+        if self.bad_model is not None and train_with_autog:
+            self.bad_model.eval()
+            eps_pos = self.model(x0, t, y)
+            eps_bad = self.bad_model(x0, t, None)
+            w = guidance_scale
+            eps_theta = eps_pos + w * (eps_pos - eps_bad)
+        
+        else:
+            eps_theta = self.model(x_noisy, t, y_in).to(self.device)
+        # noise_pred = self.model(x_noisy, t, y_in).to(self.device)
+        loss = F.mse_loss(eps_theta, noise)
+        return loss, eps_theta
 
     # Sampling step: x_{t-1} from x_t
     @torch.no_grad()
@@ -253,8 +271,9 @@ def train(cfg: DDPMConfig):
     ema = EMA(model, decay=cfg.ema_decay)
     
     # loss, fid tracking
-    fid_values = []
+    fid_values_with_steps = []
     loss_values = []
+    steps = []
     
     # bad model for Auto-Guidance
     resume_epochs = 0
@@ -274,7 +293,7 @@ def train(cfg: DDPMConfig):
     model.train()
 
     for epoch in range(cfg.epochs):
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs}", leave=False)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs}, {global_step}", leave=False)
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device) if y is not None else None
@@ -284,8 +303,8 @@ def train(cfg: DDPMConfig):
 
             use_uncond = torch.rand(1, device=x.device).item() < cfg.drop_cond_prob
             y_in = None if use_uncond else y
-            
-            loss, _ = ddpm.p_losses(x, t, y=y_in)
+
+            loss, _ = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale)
             loss.backward()
             loss_values.append(loss.item())
             
@@ -302,8 +321,20 @@ def train(cfg: DDPMConfig):
                 # Save samples with EMA weights for better quality
                 ema.apply_shadow(model)
                 save_samples(ddpm, os.path.join(cfg.logdir, "samples"), step=global_step, n=16, guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
-                fid = compute_fid(ddpm, train_loader, device, out_dir=os.path.join(cfg.logdir, "fid"), n_samples=5000, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
-                fid_values.append(fid)
+                fid = compute_fid(ddpm, train_loader, device, out_dir=os.path.join(cfg.logdir, "fid"), n_samples=5000, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode, logdir=cfg.logdir, step=global_step)
+                fid_values_with_steps.append((fid, global_step, ddpm.model.state_dict()))
+                steps.append(global_step)
+                current_fid_difference, idx = 0, len(fid_values_with_steps)-1
+                
+                while current_fid_difference > cfg.fid_threshold and len(fid_values_with_steps) > 1 and idx > 0:
+                    current_fid, step, snapshot = fid_values_with_steps[idx]
+                    previous_fid, _, _ = fid_values_with_steps[idx-1]
+                    current_fid_difference = previous_fid - current_fid
+                    if current_fid_difference > cfg.fid_threshold:
+                        print(f"Updating bad model from step {step} with FID improvement {current_fid_difference:.4f}")
+                        ddpm.update_bad_model(snapshot)
+                    idx -= 1
+                
                 ema.restore(model)
 
             global_step += 1
@@ -320,9 +351,11 @@ def train(cfg: DDPMConfig):
                 "step": global_step,
             }, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
-    
-    plot_all(loss_values, fid_values, out_dir=cfg.logdir)
-    
+
+    only_fid_values = [f[0] for f in fid_values_with_steps]
+
+    plot_all(loss_values, only_fid_values, out_dir=cfg.logdir, mode=cfg.guidance_mode, steps=steps)
+
 def plot_loss(loss_values, out_path):
     import matplotlib.pyplot as plt
     plt.figure()
@@ -331,14 +364,18 @@ def plot_loss(loss_values, out_path):
     plt.xlabel('Iteration')
     plt.ylabel('MSE Loss')
     plt.grid(True)
+    
+    for i, v in enumerate(loss_values):
+        plt.text(i, v, f"{v:.4f}", ha='center', va='bottom', fontsize=6, rotation=45)
+    
     plt.savefig(out_path)
     plt.close()
     print(f"Saved loss plot to {out_path}")
 
-def plot_all(loss_values, fid_values, out_dir, mode=None):
+def plot_all(loss_values, fid_values, out_dir, mode=None, steps=None):
     os.makedirs(out_dir, exist_ok=True)
     plot_loss(loss_values, os.path.join(out_dir, f"{mode}_training_loss.png"))
-    plot_fid(fid_values, os.path.join(out_dir, f"{mode}_fid_over_time.png"))
+    plot_fid(fid_values, os.path.join(out_dir, f"{mode}_fid_over_time.png"), global_step=steps)
 
 def load_checkpoint(ckpt_path: str, model: nn.Module, ema: EMA, opt: torch.optim.Optimizer):
     checkpoint = torch.load(ckpt_path, map_location='cpu')
@@ -353,7 +390,7 @@ def load_checkpoint(ckpt_path: str, model: nn.Module, ema: EMA, opt: torch.optim
 
 # ----------------------------- FID Computation -----------------------------
 @torch.no_grad()
-def compute_fid(ddpm: DDPM, data_loader, device: torch.device, out_dir: str, n_samples: int = 5000, batch_size: int = 128, guidance_scale: Optional[float] = None, guidance_mode: Optional[str] = None) -> float:
+def compute_fid(ddpm: DDPM, data_loader, device: torch.device, out_dir: str, n_samples: int = 5000, batch_size: int = 128, guidance_scale: Optional[float] = None, guidance_mode: Optional[str] = None, logdir: Optional[str] = None, step: Optional[int] = None) -> float:
     """
     Compute FID score between generated samples and real CIFAR-10 images.
 
@@ -399,16 +436,29 @@ def compute_fid(ddpm: DDPM, data_loader, device: torch.device, out_dir: str, n_s
     paths = [real_dir, gen_dir]
     fid_value = fid_score.calculate_fid_given_paths(paths, batch_size, device, dims=2048)
     print(f"FID: {fid_value:.4f}")
+    
+    # --- Logging ---
+    if logdir is not None:
+        os.makedirs(logdir, exist_ok=True)
+        log_path = os.path.join(logdir, "fid_log.txt")
+        with open(log_path, "a") as f:
+            f.write(f"{step if step is not None else 'NA'}\t{fid_value:.6f}\n")
+        print(f"Logged FID to {log_path}")
+    
     return fid_value
 
-def plot_fid(fid_values, out_path):
+def plot_fid(fid_values, out_path, global_step=None):
     import matplotlib.pyplot as plt
     plt.figure()
-    plt.plot(fid_values, marker='o')
+    plt.plot(global_step, fid_values, marker='o')
     plt.title('FID over Time')
     plt.xlabel('Evaluation Step')
     plt.ylabel('FID')
     plt.grid(True)
+    
+    for i, v in enumerate(fid_values):
+        plt.text(i, v, f"{v:.2f}", ha='center', va='bottom', fontsize=6, rotation=45)
+        
     plt.savefig(out_path)
     plt.close()
     print(f"Saved FID plot to {out_path}")
@@ -430,12 +480,13 @@ def build_argparser():
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--logdir", type=str, default="runs/ddpm")
-    p.add_argument("--ckpt_every", type=int, default=5)
+    p.add_argument("--ckpt_every", type=int, default=50)
     
     p.add_argument("--num_classes", type=int, default=10)
     p.add_argument("--drop_cond_prob", type=float, default=0.1)
     p.add_argument("--guidance_mode", type=str, default='cfg', choices=['cfg', 'autog', 'none'])
     p.add_argument("--guidance_scale", type=float, default=3.0)
+    p.add_argument("--train_with_autog", type=bool, help="Whether to use Auto-Guidance during training (requires bad model)", default=False)
     
     # p.add_argument("--device", type=str, default='cuda', help="Device to use (default: cuda if available)")
     p.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to bad model")
