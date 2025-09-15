@@ -62,6 +62,7 @@ class DDPMConfig:
     
     # path
     ckpt_path: Optional[str] = None
+    bad_model_ckpt: Optional[str] = None  # path to bad model checkpoint for Auto-Guidance
     
 # ---------------------------- Beta Schedules -------------------------------
 
@@ -106,8 +107,10 @@ class DDPM(nn.Module):
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
         self.register_buffer("posterior_variance", betas * (1.0 - alphas_bar_prev) / (1.0 - alphas_bar))
 
-    def get_bad_model_from_snapshot(self):
+    def get_bad_model_from_snapshot(self, bad_model_ckpt_path):
         self.bad_model = copy.deepcopy(self.model).eval().to(self.device)
+        self.bad_model.load_state_dict(torch.load(bad_model_ckpt_path, map_location=self.device)['model'])
+        print(f"Loaded bad model from {bad_model_ckpt_path} for Auto-Guidance")
         for p in self.bad_model.parameters():
             p.requires_grad = False
     
@@ -140,8 +143,8 @@ class DDPM(nn.Module):
         if self.bad_model is not None:
             # print('Using Auto-Guidance during training')
             self.bad_model.eval()
-            eps_pos = self.model(x0, t, y)
-            eps_bad = self.bad_model(x0, t, None)
+            eps_pos = self.model(x_noisy, t, y)
+            eps_bad = self.bad_model(x_noisy, t, None)
             w = guidance_scale
             eps_theta = eps_pos + w * (eps_pos - eps_bad)
         
@@ -160,24 +163,24 @@ class DDPM(nn.Module):
         sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t][:, None, None, None]
 
         # predict noise using the model
-        if guidance_mode == 'none' and guidance_scale == 1.0:
+        # if guidance_mode == 'none' and guidance_scale == 1.0:
             # Classifier-Free Guidance
-            eps_theta = self.model(x_t, t, None if y is None else y)
-        elif guidance_mode == 'cfg':
-            eps_uncond = self.model(x_t, t, None)
-            eps_cond   = self.model(x_t, t, y)
-            w = guidance_scale
-            eps_theta = (1 + w) * eps_cond - w * eps_uncond
+        eps_theta = self.model(x_t, t, None if y is None else y)
+        # elif guidance_mode == 'cfg':
+        #     eps_uncond = self.model(x_t, t, None)
+        #     eps_cond   = self.model(x_t, t, y)
+        #     w = guidance_scale
+        #     eps_theta = (1 + w) * eps_cond - w * eps_uncond
             
-        elif guidance_mode == 'autog':
-            # Auto-Guidance
-            assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
-            eps_pos = self.model(x_t, t, y)
-            eps_bad = self.bad_model(x_t, t, None)
-            w = guidance_scale
-            eps_theta = eps_pos + w * (eps_pos - eps_bad)
-        else:
-            raise ValueError(f"Unknown guidance mode: {guidance_mode}")
+        # elif guidance_mode == 'autog':
+        #     # Auto-Guidance
+        #     assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
+        #     eps_pos = self.model(x_t, t, y)
+        #     eps_bad = self.bad_model(x_t, t, None)
+        #     w = guidance_scale
+        #     eps_theta = eps_pos + w * (eps_pos - eps_bad)
+        # else:
+        #     raise ValueError(f"Unknown guidance mode: {guidance_mode}")
 
         # DDPM mean
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * eps_theta / sqrt_one_minus_alphas_bar_t)
@@ -283,7 +286,7 @@ def train(cfg: DDPMConfig):
     if cfg.guidance_mode == 'autog':
         assert cfg.ckpt_path is not None, "Please provide a checkpoint path for bad model in Auto-Guidance mode."
         ddpm.model = load_checkpoint(cfg.ckpt_path, model, ema, opt)[0].to(device)
-        ddpm.get_bad_model_from_snapshot()
+        ddpm.get_bad_model_from_snapshot(cfg.bad_model_ckpt)
         print("Bad model for Auto-Guidance is set.")
 
     if cfg.ckpt_path is not None:
@@ -492,6 +495,7 @@ def build_argparser():
     
     # p.add_argument("--device", type=str, default='cuda', help="Device to use (default: cuda if available)")
     p.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to bad model")
+    p.add_argument("--bad_model_ckpt", type=str, default='/home/jasonx62301/for_python/Auto-Guidance-test/runs/ddpm/ckpt_epoch_200.pt', help="Path to bad model checkpoint for Auto-Guidance")
     return p
 
 
