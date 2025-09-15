@@ -137,7 +137,8 @@ class DDPM(nn.Module):
         else:
             y_in = y
         
-        if self.bad_model is not None and train_with_autog:
+        if self.bad_model is not None:
+            # print('Using Auto-Guidance during training')
             self.bad_model.eval()
             eps_pos = self.model(x0, t, y)
             eps_bad = self.bad_model(x0, t, None)
@@ -145,6 +146,7 @@ class DDPM(nn.Module):
             eps_theta = eps_pos + w * (eps_pos - eps_bad)
         
         else:
+            # print('Not using Auto-Guidance during training')
             eps_theta = self.model(x_noisy, t, y_in).to(self.device)
         # noise_pred = self.model(x_noisy, t, y_in).to(self.device)
         loss = F.mse_loss(eps_theta, noise)
