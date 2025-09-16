@@ -57,7 +57,7 @@ class DDPMConfig:
     drop_cond_prob: float = 0.1    
     guidance_scale: float = 3.0    
     guidance_mode: Optional[str] = 'cfg'  # 'cfg' or 'autog' or None
-    train_with_autog: bool = False  # whether to use Auto-Guidance during training (requires bad model)
+    train_with_autog: str = 'False'  # whether to use Auto-Guidance during training (requires bad model)
     fid_threshold: float = 2.0  # update bad model if fid improves by this much
     
     # path
@@ -131,7 +131,7 @@ class DDPM(nn.Module):
         return sqrt_ab * x0 + sqrt_omab * noise
 
     # Training loss: predict epsilon (noise)
-    def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None, train_with_autog: Optional[bool] = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None, train_with_autog: Optional[str] = 'False', t_2: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         noise = torch.randn_like(x0).to(self.device)
         x_noisy = self.q_sample(x0, t, noise).to(self.device)
         
@@ -140,47 +140,47 @@ class DDPM(nn.Module):
         else:
             y_in = y
         
-        if self.bad_model is not None:
-            # print('Using Auto-Guidance during training')
-            self.bad_model.eval()
-            eps_pos = self.model(x_noisy, t, y)
-            eps_bad = self.bad_model(x_noisy, t, None)
-            w = guidance_scale
-            eps_theta = eps_pos + w * (eps_pos - eps_bad)
+        # if self.bad_model is not None and train_with_autog == 'True':
+        #     # print('Using Auto-Guidance during training')
+        #     self.bad_model.eval()
+        #     eps_pos = self.model(x_noisy, t_2, None)
+        #     eps_bad = self.bad_model(x_noisy, t, None)
+        #     w = guidance_scale
+        #     eps_theta = eps_pos + w * (eps_pos - eps_bad)
         
-        else:
+        # else:
             # print('Not using Auto-Guidance during training')
-            eps_theta = self.model(x_noisy, t, y_in).to(self.device)
+        eps_theta = self.model(x_noisy, t, y_in).to(self.device)
         # noise_pred = self.model(x_noisy, t, y_in).to(self.device)
         loss = F.mse_loss(eps_theta, noise)
         return loss, eps_theta
 
     # Sampling step: x_{t-1} from x_t
     @torch.no_grad()
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0, guidance_mode: Optional[str] = None) -> torch.Tensor:
+    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0, guidance_mode: Optional[str] = None, t_2: Optional[torch.Tensor] = None) -> torch.Tensor:
         betas_t = self.betas[t][:, None, None, None]
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t][:, None, None, None]
         sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t][:, None, None, None]
 
         # predict noise using the model
-        # if guidance_mode == 'none' and guidance_scale == 1.0:
+        if guidance_mode == 'none' or guidance_scale == 0.0:
             # Classifier-Free Guidance
-        eps_theta = self.model(x_t, t, None if y is None else y)
-        # elif guidance_mode == 'cfg':
-        #     eps_uncond = self.model(x_t, t, None)
-        #     eps_cond   = self.model(x_t, t, y)
-        #     w = guidance_scale
-        #     eps_theta = (1 + w) * eps_cond - w * eps_uncond
+            eps_theta = self.model(x_t, t, None if y is None else y)
+        elif guidance_mode == 'cfg':
+            eps_uncond = self.model(x_t, t, None)
+            eps_cond   = self.model(x_t, t, y)
+            w = guidance_scale
+            eps_theta = (1 + w) * eps_cond - w * eps_uncond
             
-        # elif guidance_mode == 'autog':
-        #     # Auto-Guidance
-        #     assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
-        #     eps_pos = self.model(x_t, t, y)
-        #     eps_bad = self.bad_model(x_t, t, None)
-        #     w = guidance_scale
-        #     eps_theta = eps_pos + w * (eps_pos - eps_bad)
-        # else:
-        #     raise ValueError(f"Unknown guidance mode: {guidance_mode}")
+        elif guidance_mode == 'autog':
+            # Auto-Guidance
+            assert self.bad_model is not None, "Bad model must be set for Auto-Guidance"
+            eps_pos = self.model(x_t, t_2, None)
+            eps_bad = self.bad_model(x_t, t, None)
+            w = guidance_scale
+            eps_theta = eps_pos + w * (eps_pos - eps_bad)
+        else:
+            raise ValueError(f"Unknown guidance mode: {guidance_mode}")
 
         # DDPM mean
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * eps_theta / sqrt_one_minus_alphas_bar_t)
@@ -207,7 +207,11 @@ class DDPM(nn.Module):
         
         for i in reversed(range(self.cfg.timesteps)):
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            img = self.p_sample(img, t, y=labels, guidance_scale=g, guidance_mode=guidance_mode)
+            # if t[0] == 0:
+            img = self.p_sample(img, t, y=labels, guidance_scale=g, guidance_mode='none')  # no guidance at last step
+            # else: 
+            #     t_2 = torch.full((batch_size,), i // 2, device=self.device, dtype=torch.long)  # for time-step interpolation in Auto-Guidance
+            #     img = self.p_sample(img, t, y=labels, guidance_scale=g, guidance_mode=guidance_mode, t_2=t_2)
         return img
 
 
@@ -304,12 +308,12 @@ def train(cfg: DDPMConfig):
             y = y.to(device) if y is not None else None
             
             b = x.size(0)
-            t = torch.randint(0, cfg.timesteps, (b,), device=device, dtype=torch.long)
-
+            t = torch.randint(1, cfg.timesteps, (b,), device=device, dtype=torch.long)
+            t_2 = torch.full((b,), t[0] // 2, device=device, dtype=torch.long)  # for time-step interpolation in Auto-Guidance
             use_uncond = torch.rand(1, device=x.device).item() < cfg.drop_cond_prob
             y_in = None if use_uncond else y
 
-            loss, _ = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale)
+            loss, _ = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale, t_2=t_2)
             loss.backward()
             loss_values.append(loss.item())
             
@@ -391,7 +395,22 @@ def load_checkpoint(ckpt_path: str, model: nn.Module, ema: EMA, opt: torch.optim
     print(f"Loaded checkpoint from {ckpt_path} at step {step}")
     return model, ema, opt, step
 
+# ----------------------------- Evaluation ---------------------------------
+def eval_fid(cfg: DDPMConfig):
+    device = default_device()
+    _, test_loader = get_dataloaders(data_dir=os.path.join(cfg.logdir, "data"), batch_size=cfg.batch_size)
 
+    model = UNet(in_ch=cfg.channels, base_ch=128, ch_mults=(1, 2, 2, 2), time_emb_dim=512, with_attn=(False, True, True, False), num_classes=cfg.num_classes)
+    model.to(device)
+
+    ddpm = DDPM(model, cfg, device)
+
+    if cfg.ckpt_path is not None:
+        model, _, _, _ = load_checkpoint(cfg.ckpt_path, model, EMA(model), torch.optim.AdamW(model.parameters(), lr=cfg.lr))
+        print(f"Loaded model from checkpoint: {cfg.ckpt_path}")
+
+    fid = compute_fid(ddpm, test_loader, device, out_dir=os.path.join(cfg.logdir, "fid_eval"), n_samples=5000, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
+    print(f"Final FID on test set: {fid:.4f}")
 
 # ----------------------------- FID Computation -----------------------------
 @torch.no_grad()
@@ -491,7 +510,7 @@ def build_argparser():
     p.add_argument("--drop_cond_prob", type=float, default=0.1)
     p.add_argument("--guidance_mode", type=str, default='cfg', choices=['cfg', 'autog', 'none'])
     p.add_argument("--guidance_scale", type=float, default=3.0)
-    p.add_argument("--train_with_autog", type=bool, help="Whether to use Auto-Guidance during training (requires bad model)", default=False)
+    p.add_argument("--train_with_autog", type=str, help="Whether to use Auto-Guidance during training (requires bad model)", default='False')
     
     # p.add_argument("--device", type=str, default='cuda', help="Device to use (default: cuda if available)")
     p.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to bad model")
