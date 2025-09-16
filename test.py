@@ -141,19 +141,19 @@ class DDPM(nn.Module):
             y_in = y
         
         # if self.bad_model is not None and train_with_autog == 'True':
-        #     # print('Using Auto-Guidance during training')
-        #     self.bad_model.eval()
-        #     eps_pos = self.model(x_noisy, t_2, None)
-        #     eps_bad = self.bad_model(x_noisy, t, None)
-        #     w = guidance_scale
-        #     eps_theta = eps_pos + w * (eps_pos - eps_bad)
+            # print('Using Auto-Guidance during training')
+        self.bad_model.eval()
+        eps_pos = self.model(x_noisy, t_2, None)
+        eps_bad = self.bad_model(x_noisy, t, None)
+        w = guidance_scale
+        eps_theta = eps_pos + w * (eps_pos - eps_bad)
         
         # else:
             # print('Not using Auto-Guidance during training')
-        eps_theta = self.model(x_noisy, t, y_in).to(self.device)
+        # eps_theta = self.model(x_noisy, t, y_in).to(self.device)
         # noise_pred = self.model(x_noisy, t, y_in).to(self.device)
-        loss = F.mse_loss(eps_theta, noise)
-        return loss, eps_theta
+        # loss = F.mse_loss(eps_theta, noise)
+        return eps_theta
 
     # Sampling step: x_{t-1} from x_t
     @torch.no_grad()
@@ -313,10 +313,22 @@ def train(cfg: DDPMConfig):
             use_uncond = torch.rand(1, device=x.device).item() < cfg.drop_cond_prob
             y_in = None if use_uncond else y
 
-            loss, _ = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale, t_2=t_2)
-            loss.backward()
-            loss_values.append(loss.item())
+            loss = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale, t_2=t_2)
             
+            # grads = torch.autograd.grad(
+            #     outputs=loss,
+            #     inputs=model.parameters(),
+            #     grad_outputs=torch.ones_like(loss),
+            #     create_graph=True,
+            #     allow_unused=True
+            # )
+            # print(grads[0])
+            torch.autograd.backward(
+                loss,
+                grad_tensors=torch.ones_like(loss)
+            )
+            # loss_values.append(loss.item())
+            loss_values.append(0)
             if (global_step + 1) % cfg.grad_accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -324,7 +336,7 @@ def train(cfg: DDPMConfig):
                 ema.update(model)
 
             if global_step % 500 == 0:
-                print(f"epoch {epoch} step {global_step} loss {loss.item():.4f}")
+                print(f"epoch {epoch} step {global_step} loss")
 
             if global_step % 5000 == 0 and global_step > 0:
                 # Save samples with EMA weights for better quality
