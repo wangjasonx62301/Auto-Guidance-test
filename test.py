@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from pytorch_fid import fid_score
 from tqdm import tqdm
+import logging
+from datetime import datetime
 # -----------------------------------------------------------------------------
 from unet import UNet 
 from dataset import get_dataloaders  
@@ -28,6 +30,22 @@ from dataset import get_dataloaders
 # def get_dataloaders(data_dir: str, batch_size: int, num_workers: int = 4):
 #     raise NotImplementedError("Please import your actual get_dataloaders implementation and remove the stub.")
 # -----------------------------------------------------------------------------
+
+# Set up logging
+def setup_logging(logdir: str, filename: str = "training.log"):
+    os.makedirs(logdir, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+    log_path = os.path.join(logdir, filename)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="a"),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info(f"Logging initialized. Log file at {log_path}")
 
 
 def default_device() -> torch.device:
@@ -110,7 +128,7 @@ class DDPM(nn.Module):
     def get_bad_model_from_snapshot(self, bad_model_ckpt_path):
         self.bad_model = copy.deepcopy(self.model).eval().to(self.device)
         self.bad_model.load_state_dict(torch.load(bad_model_ckpt_path, map_location=self.device)['model'])
-        print(f"Loaded bad model from {bad_model_ckpt_path} for Auto-Guidance")
+        logging.info(f"Loaded bad model from {bad_model_ckpt_path} for Auto-Guidance")
         for p in self.bad_model.parameters():
             p.requires_grad = False
     
@@ -129,6 +147,18 @@ class DDPM(nn.Module):
         sqrt_ab = self.sqrt_alphas_bar[t][:, None, None, None].to(self.device)
         sqrt_omab = self.sqrt_one_minus_alphas_bar[t][:, None, None, None].to(self.device)
         return sqrt_ab * x0 + sqrt_omab * noise
+    
+    def q_posterior_mean(self, x0: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        
+        alpha_bar_t = self.alphas_bar[t][:, None, None, None].to(self.device)
+        alpha_bar_prev = self.alphas_bar_prev[t][:, None, None, None].to(self.device)
+        betas_t = self.betas[t][:, None, None, None].to(self.device)
+        
+        coef1 = betas_t * torch.sqrt(alpha_bar_prev) / (1.0 - alpha_bar_t)
+        coef2 = (1.0 - alpha_bar_prev) * torch.sqrt(1.0 / (alpha_bar_t)) / (1.0 - alpha_bar_t)
+        
+        mu_q = coef1 * x0 + coef2 * x_t
+        return mu_q
 
     # Training loss: predict epsilon (noise)
     def p_losses(self, x0: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: Optional[float] = None, train_with_autog: Optional[str] = 'False', t_2: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -143,21 +173,34 @@ class DDPM(nn.Module):
         # if self.bad_model is not None and train_with_autog == 'True':
             # print('Using Auto-Guidance during training')
         self.bad_model.eval()
-        eps_pos = self.model(x_noisy, t_2, None)
+        eps_pos = self.model(x_noisy, t_2, y_in)
         eps_bad = self.bad_model(x_noisy, t, None)
         w = guidance_scale
         eps_theta = eps_pos + w * (eps_pos - eps_bad)
+        
+        with torch.no_grad():
+            eps_pos = self.model(x_noisy, t_2, None).detach()
+            eps_bad = self.bad_model(x_noisy, t, None).detach()
+            diff = (eps_pos - eps_bad).view(eps_pos.size(0), -1)
+            l2_per_sample = (diff ** 2).sum(dim=1).cpu().numpy()
+            logging.info(f"Auto-Guidance L2 norm per sample: {l2_per_sample.mean():.4f} ± {l2_per_sample.std():.4f}")
         
         # else:
             # print('Not using Auto-Guidance during training')
         # eps_theta = self.model(x_noisy, t, y_in).to(self.device)
         # noise_pred = self.model(x_noisy, t, y_in).to(self.device)
-        # loss = F.mse_loss(eps_theta, noise)
+        # loss = F.mse_loss(eps_theta, noise, reduction='none')
         return eps_theta
 
     # Sampling step: x_{t-1} from x_t
-    @torch.no_grad()
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0, guidance_mode: Optional[str] = None, t_2: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # @torch.no_grad()
+    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None, guidance_scale: float = 1.0, guidance_mode: Optional[str] = None, t_2: Optional[torch.Tensor] = None, training: bool = False) -> torch.Tensor:
+        
+        if training:
+            self.model.train()
+        else:
+            self.model.eval()    
+        
         betas_t = self.betas[t][:, None, None, None]
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t][:, None, None, None]
         sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t][:, None, None, None]
@@ -185,6 +228,9 @@ class DDPM(nn.Module):
         # DDPM mean
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * eps_theta / sqrt_one_minus_alphas_bar_t)
 
+        if training:
+            return model_mean, eps_theta
+        
         if (t == 0).all():
             return model_mean
         else:
@@ -213,6 +259,7 @@ class DDPM(nn.Module):
             #     t_2 = torch.full((batch_size,), i // 2, device=self.device, dtype=torch.long)  # for time-step interpolation in Auto-Guidance
             #     img = self.p_sample(img, t, y=labels, guidance_scale=g, guidance_mode=guidance_mode, t_2=t_2)
         return img
+
 
 
 # ----------------------------- EMA Wrapper ---------------------------------
@@ -250,6 +297,28 @@ class EMA:
         self.backup = {}
 
 
+class ConvQNet(nn.Module):
+    def __init__(self, in_channels=3, base_channels=64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 4, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(base_channels * 2, base_channels * 4, 4, 2, 1),
+            nn.ReLU(),
+        )
+        self.fc = nn.Linear(base_channels * 8 * 8, 1)  
+
+    def forward(self, x):
+        # print(x.shape)
+        h = self.conv(x)
+        # print(h.shape)
+        h = h.view(h.size(0), -1)
+        # print(h.shape)
+        score = self.fc(h)
+        return score  # (B, 1)
+
 # ----------------------------- Training Loop -------------------------------
 
 @torch.no_grad()
@@ -259,7 +328,7 @@ def save_samples(ddpm: DDPM, out_dir: str, step: int, n: int = 16, guidance_scal
     # The training data is normalized to [-1, 1]; save_image can auto-normalize
     save_path = os.path.join(out_dir, f"samples_step_{step:07d}.png")
     save_image(samples, save_path, nrow=int(math.sqrt(n)), normalize=True, value_range=(-1, 1))
-    print(f"Saved samples to {save_path}")
+    logging.info(f"Saved samples to {save_path}")
 
 
 def train(cfg: DDPMConfig):
@@ -278,6 +347,13 @@ def train(cfg: DDPMConfig):
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     ema = EMA(model, decay=cfg.ema_decay)
+
+    if cfg.guidance_mode == "autog":
+        q_net = ConvQNet(in_channels=cfg.channels).to(device)
+        q_opt = torch.optim.Adam(q_net.parameters(), lr=1e-4)
+        logging.info("Initialized q_net for Auto-Guidance.")
+    else:
+        q_net, q_opt = None, None
     
     # loss, fid tracking
     fid_values_with_steps = []
@@ -291,11 +367,11 @@ def train(cfg: DDPMConfig):
         assert cfg.ckpt_path is not None, "Please provide a checkpoint path for bad model in Auto-Guidance mode."
         ddpm.model = load_checkpoint(cfg.ckpt_path, model, ema, opt)[0].to(device)
         ddpm.get_bad_model_from_snapshot(cfg.bad_model_ckpt)
-        print("Bad model for Auto-Guidance is set.")
+        logging.info("Bad model for Auto-Guidance is set.")
 
     if cfg.ckpt_path is not None:
         model, ema, opt, start_step = load_checkpoint(cfg.ckpt_path, model, ema, opt)
-        print(f"Resumed training from checkpoint: {cfg.ckpt_path} at step {start_step}")
+        logging.info(f"Resumed training from checkpoint: {cfg.ckpt_path} at step {start_step}")
         resume_epochs += int(cfg.ckpt_path.split('_')[-1].split('.')[0])  # continue for more epochs
 
     global_step = 0
@@ -313,30 +389,120 @@ def train(cfg: DDPMConfig):
             use_uncond = torch.rand(1, device=x.device).item() < cfg.drop_cond_prob
             y_in = None if use_uncond else y
 
-            loss = ddpm.p_losses(x, t, y=y_in, guidance_scale=cfg.guidance_scale, t_2=t_2)
+            # TODO
+            # forward
+            noise = torch.randn_like(x).to(device)
+            x_t = ddpm.q_sample(x, t, noise)
+            x_t_minus1_true = ddpm.q_posterior_mean(x, x_t, t)
+            
+            alpha = 0.1
+            
+            # model prediction
+            model_mean, x_t_minus1_model = ddpm.p_sample(x_t, t, y_in, guidance_scale=0.0, guidance_mode='none', t_2=t_2, training=True)
+                
+            reg_weight = 0.6
+
+            reg_loss = - F.mse_loss(x_t_minus1_model, x_t_minus1_true, reduction='mean')
+
+            if cfg.guidance_mode == 'autog':
+                x_t_minus1_model.requires_grad_(True)
+                guidance_score = q_net(x_t_minus1_model)
+                guidance_grad = torch.autograd.grad(
+                    outputs=guidance_score.sum(),
+                    inputs=x_t_minus1_model,
+                    create_graph=False,
+                    retain_graph=False,
+                    # allow_unused=True
+                )[0]
+                x_t_minus1_guided = x_t_minus1_model + alpha * guidance_grad
+                diffusion_loss = F.mse_loss(x_t_minus1_guided, x_t_minus1_true)
+                
+                # q_net loss
+                score_real = q_net(x_t_minus1_true.detach())
+                score_fake = q_net(x_t_minus1_model.detach())
+                d_loss_real = F.mse_loss(score_real, torch.ones_like(score_real))
+                d_loss_fake = F.mse_loss(score_fake, torch.zeros_like(score_fake))
+                q_loss = 0.5 * (d_loss_real + d_loss_fake)
+            else:
+                diffusion_loss = reg_loss
+                q_loss = torch.tensor(0.0, device=device)
+            
+            loss = diffusion_loss + q_loss
+            loss.backward()
+            
+            # var_t = ddpm.posterior_variance[t][:, None, None, None]
+            # logp_per_sample = -0.5 * (((x_t_minus1_true - model_mean) ** 2) / (var_t + 1e-8)).view(b, -1).sum(dim=1)
+            # logp_mean = logp_per_sample.mean()
+            # eps_theta = ddpm.p_sample(x_t, t-1, y_in, guidance_scale=0.0, guidance_mode=cfg.guidance_mode, t_2=t_2)
+                
+            # lambda_guidance = 1 - reg_weight
+            
+            # loss = reg_weight * reg_loss + lambda_guidance * eps_theta.mean()
+            
+            # loss.backward()
+            # loss = -logp_mean - lambda_guidance * guidance_score
+            
+            with torch.no_grad():
+                eps_pos = model(x_t, t_2, None).detach()
+                eps_bad = ddpm.bad_model(x_t, t-1, None).detach()
+                diff = (eps_pos - eps_bad).view(eps_pos.size(0), -1)
+                l2_per_sample = (diff ** 2).sum(dim=1).cpu().numpy()
+            
+            # l2_per_sample = (diff ** 2).sum(dim=1).cpu()
+            logging.info(f"Auto-Guidance L2 norm per sample: {l2_per_sample.mean():.4f} ± {l2_per_sample.std():.4f}")
+            
+            # loss.backward()
+            
+            # x_t_1 = ddpm.p_sample(x, t, y_in, guidance_scale=cfg.guidance_scale, guidance_mode='none', t_2=t_2, training=True)
+            # eps_theta = ddpm.p_losses(x_t_minus1_model, t, y_in, guidance_scale=cfg.guidance_scale, train_with_autog=cfg.train_with_autog, t_2=t_2)
+            
+            
+            # loss = ((x_t_minus1_true - x_t_minus1_model) ** 2).mean()
+            
+            # torch.autograd.backward(
+            #     tensors=x_t_minus1_model,
+            #     grad_tensors=eps_theta,
+            #     retain_graph=True
+            # )
+            
+            # loss.backward()
+                        
+            # print(eps_theta.shape, x_t_1.shape)
             
             # grads = torch.autograd.grad(
-            #     outputs=loss,
+            #     outputs=x_t_1,
             #     inputs=model.parameters(),
-            #     grad_outputs=torch.ones_like(loss),
-            #     create_graph=True,
+            #     grad_outputs=eps_theta,
+            #     create_graph=False,
+            #     retain_graph=False,
+            #     only_inputs=True,
             #     allow_unused=True
             # )
+            
+            # # alpha = 0.1
+
+            
+            # for p, g in zip(model.parameters(), grads):
+            #     if g is not None:
+            #         # if p.grad is None:
+            #         p.grad = g
+                    
             # print(grads[0])
-            torch.autograd.backward(
-                loss,
-                grad_tensors=torch.ones_like(loss)
-            )
-            # loss_values.append(loss.item())
-            loss_values.append(0)
+            # loss = loss.sum()
+            # loss.backward()
+            loss_values.append(loss.item())
+            logging.info(f"Step {global_step}, Loss: {loss.item():.4f}")
+            # loss_values.append(0)
             if (global_step + 1) % cfg.grad_accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 ema.update(model)
 
-            if global_step % 500 == 0:
-                print(f"epoch {epoch} step {global_step} loss")
+            
+            
+            # if global_step % 500 == 0:
+            #     logging.info(f"epoch {epoch} step {global_step} loss ")
 
             if global_step % 5000 == 0 and global_step > 0:
                 # Save samples with EMA weights for better quality
@@ -347,12 +513,13 @@ def train(cfg: DDPMConfig):
                 steps.append(global_step)
                 current_fid_difference, idx = 0, len(fid_values_with_steps)-1
                 
+                # update bad model if fid improves by more than threshold
                 while current_fid_difference > cfg.fid_threshold and len(fid_values_with_steps) > 1 and idx > 0:
                     current_fid, step, snapshot = fid_values_with_steps[idx]
                     previous_fid, _, _ = fid_values_with_steps[idx-1]
                     current_fid_difference = previous_fid - current_fid
                     if current_fid_difference > cfg.fid_threshold:
-                        print(f"Updating bad model from step {step} with FID improvement {current_fid_difference:.4f}")
+                        logging.info(f"Updating bad model from step {step} with FID improvement {current_fid_difference:.4f}")
                         ddpm.update_bad_model(snapshot)
                     idx -= 1
                 
@@ -371,7 +538,7 @@ def train(cfg: DDPMConfig):
                 "cfg": cfg.__dict__,
                 "step": global_step,
             }, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+            logging.info(f"Saved checkpoint: {ckpt_path}")
 
     only_fid_values = [f[0] for f in fid_values_with_steps]
 
@@ -391,7 +558,7 @@ def plot_loss(loss_values, out_path):
     
     plt.savefig(out_path)
     plt.close()
-    print(f"Saved loss plot to {out_path}")
+    logging.info(f"Saved loss plot to {out_path}")
 
 def plot_all(loss_values, fid_values, out_dir, mode=None, steps=None):
     os.makedirs(out_dir, exist_ok=True)
@@ -404,7 +571,7 @@ def load_checkpoint(ckpt_path: str, model: nn.Module, ema: EMA, opt: torch.optim
     ema.shadow = checkpoint['ema']
     opt.load_state_dict(checkpoint['opt'])
     step = checkpoint.get('step', 0)
-    print(f"Loaded checkpoint from {ckpt_path} at step {step}")
+    logging.info(f"Loaded checkpoint from {ckpt_path} at step {step}")
     return model, ema, opt, step
 
 # ----------------------------- Evaluation ---------------------------------
@@ -419,10 +586,10 @@ def eval_fid(cfg: DDPMConfig):
 
     if cfg.ckpt_path is not None:
         model, _, _, _ = load_checkpoint(cfg.ckpt_path, model, EMA(model), torch.optim.AdamW(model.parameters(), lr=cfg.lr))
-        print(f"Loaded model from checkpoint: {cfg.ckpt_path}")
+        logging.info(f"Loaded model from checkpoint: {cfg.ckpt_path}")
 
     fid = compute_fid(ddpm, test_loader, device, out_dir=os.path.join(cfg.logdir, "fid_eval"), n_samples=5000, batch_size=128 , guidance_scale=cfg.guidance_scale, guidance_mode=cfg.guidance_mode)
-    print(f"Final FID on test set: {fid:.4f}")
+    logging.info(f"Final FID on test set: {fid:.4f}")
 
 # ----------------------------- FID Computation -----------------------------
 @torch.no_grad()
@@ -471,16 +638,16 @@ def compute_fid(ddpm: DDPM, data_loader, device: torch.device, out_dir: str, n_s
     # --- Compute FID ---
     paths = [real_dir, gen_dir]
     fid_value = fid_score.calculate_fid_given_paths(paths, batch_size, device, dims=2048)
-    print(f"FID: {fid_value:.4f}")
-    
+    logging.critical(f"FID: {fid_value:.4f}")
+
     # --- Logging ---
     if logdir is not None:
         os.makedirs(logdir, exist_ok=True)
         log_path = os.path.join(logdir, "fid_log.txt")
         with open(log_path, "a") as f:
             f.write(f"{step if step is not None else 'NA'}\t{fid_value:.6f}\n")
-        print(f"Logged FID to {log_path}")
-    
+        logging.info(f"Logged FID to {log_path}")
+
     return fid_value
 
 def plot_fid(fid_values, out_path, global_step=None):
@@ -532,6 +699,7 @@ def build_argparser():
 
 def main():
     cfg = DDPMConfig(**vars(build_argparser().parse_args()))
+    setup_logging(cfg.logdir)
     train(cfg)
 
 
